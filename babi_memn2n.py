@@ -15,15 +15,21 @@ from keras.layers import recurrent, Input, merge
 from keras.layers.recurrent import LSTM, GRU
 from keras.models import Sequential, Model
 from keras.preprocessing.sequence import pad_sequences
-from keras.callbacks import ModelCheckpoint, Callback
+from keras.callbacks import ModelCheckpoint, Callback, LearningRateScheduler
+from keras.optimizers import SGD, Adam
+from keras.activations import softmax
+from keras.metrics import categorical_accuracy
 import keras.backend as K
+from keras.utils.visualize_util import plot
+import theano.tensor as T
+import theano
 
 from keras import initializations, regularizers, constraints
 
 from functools import reduce
 import tarfile
 import numpy as np
-np.random.seed(1337)  # for reproducibility
+#np.random.seed(1337)  # for reproducibility
 
 import re
 import pdb
@@ -69,11 +75,11 @@ def parse_stories(lines, only_supporting=False):
             else:
                 # Provide all the substories
                 substory = [x for x in story if x]
-            data.append((substory, q, a))
+            data.append((substory, q[:-1], a))
             story.append('')
         else:
             sent = tokenize(line)
-            story.append([sent])
+            story.append([sent[:-1]])
     return data
 
 
@@ -86,16 +92,20 @@ def get_stories(f, only_supporting=False, max_length=None):
     data = [(flatten(story), q, answer) for story, q, answer in data if not max_length or len(flatten(story)) < max_length]
     return data
 
-def vectorize_facts(data, word_idx, story_maxlen, query_maxlen, fact_maxlen):
+def vectorize_facts(data, word_idx, story_maxlen, query_maxlen, fact_maxlen, enable_time = False):
     X = []
     Xq = []
     Y = []
     for story, query, answer in data:
         x = np.zeros((len(story), fact_maxlen),dtype='int32')
         for k,facts in enumerate(story):
-            x[k][-len(facts):] = np.array([word_idx[w] for w in facts])[:fact_maxlen]
+            if not enable_time:
+                x[k][-len(facts):] = np.array([word_idx[w] for w in facts])[:fact_maxlen]
+            else:
+                x[k][-len(facts)-1:-1] = np.array([word_idx[w] for w in facts])[:facts_maxlen-1]
+                x[k][-1] = len(word_idx) + len(story) - k
         xq = [word_idx[w] for w in query]
-        y = np.zeros(len(word_idx) + 1)
+        y = np.zeros(len(word_idx) + 1) if not enable_time else np.zeros(len(word_idx) + 1 + story_maxlen)
         y[word_idx[answer]] = 1
         X.append(x)
         Xq.append(xq)
@@ -115,14 +125,17 @@ tar = tarfile.open('babi-tasks-v1-2.tar.gz')
 
 challenges = {
     # QA1 with 10,000 samples
-    'single_supporting_fact_10k': 'tasks_1-20_v1-2/en-10k/qa1_single-supporting-fact_{}.txt',
+    'single_supporting_fact_10k': 'tasks_1-20_v1-2/en/qa1_single-supporting-fact_{}.txt',
     # QA2 with 10,000 samples
-    'two_supporting_facts_10k': 'tasks_1-20_v1-2/en-10k/qa2_two-supporting-facts_{}.txt',
+    'two_supporting_facts_10k': 'tasks_1-20_v1-2/en/qa2_two-supporting-facts_{}.txt',
+    'three_supporting_facts_10k': 'tasks_1-20_v1-2/en/qa3_three-supporting-facts_{}.txt',
+
 }
 challenge_type = 'single_supporting_fact_10k'
 challenge = challenges[challenge_type]
 
-EMBED_HIDDEN_SIZE = 64
+EMBED_HIDDEN_SIZE = 20
+enable_time = True
 
 print('Extracting stories for the challenge:', challenge_type)
 train_facts = get_stories(tar.extractfile(challenge.format('train')))
@@ -131,15 +144,18 @@ test_facts = get_stories(tar.extractfile(challenge.format('test')))
 train_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in train_facts]
 test_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in test_facts]
 
-vocab = sorted(reduce(lambda x, y: x | y, (set(story + q + [answer]) for story, q, answer in train_stories + test_stories)))
-# Reserve 0 for masking via pad_sequences
-vocab_size = len(vocab) + 1
-
 facts_maxlen = max(map(len, (x for h,_,_ in train_facts + test_facts for x in h)))
+if enable_time:
+    facts_maxlen += 1
 
 story_maxlen = max(map(len, (x for x, _, _ in train_facts + test_facts)))
 query_maxlen = max(map(len, (x for _, x, _ in train_facts + test_facts)))
 
+vocab = sorted(reduce(lambda x, y: x | y, (set(story + q + [answer]) for story, q, answer in train_stories + test_stories)))
+# Reserve 0 for masking via pad_sequences
+vocab_size = len(vocab) + 1
+if enable_time:
+    vocab_size += story_maxlen
 
 print('-')
 print('Vocab size:', vocab_size, 'unique words')
@@ -154,8 +170,10 @@ print('-')
 print('Vectorizing the word sequences...')
 
 word_idx = dict((c, i + 1) for i, c in enumerate(vocab))
-inputs_train, queries_train, answers_train = vectorize_facts(train_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen)
-inputs_test, queries_test, answers_test = vectorize_facts(test_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen)
+inputs_train, queries_train, answers_train = vectorize_facts(train_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                               enable_time=enable_time)
+inputs_test, queries_test, answers_test = vectorize_facts(test_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                         enable_time=enable_time)
 
 print('-')
 print('inputs: integer tensor of shape (samples, max_length)')
@@ -172,6 +190,44 @@ print('answers_test shape:', answers_test.shape)
 print('-')
 print('Compiling...')
 
+# This is a trick to avoid batch size average of error in training, 
+# such as is done in Weston's code with size_average = False
+class ModifiedBackprop(object):
+
+    def __init__(self, nonlinearity):
+        self.nonlinearity = nonlinearity
+        self.ops = {}  # memoizes an OpFromGraph instance per tensor type
+
+    def __call__(self, x):
+        if theano.sandbox.cuda.cuda_enabled:
+            maybe_to_gpu = theano.sandbox.cuda.as_cuda_ndarray_variable
+        else:
+            maybe_to_gpu = lambda x: x
+        x = maybe_to_gpu(x)
+        tensor_type = x.type
+        if tensor_type not in self.ops:
+            inp = tensor_type()
+            outp = maybe_to_gpu(self.nonlinearity(inp))
+            op = theano.OpFromGraph([inp], [outp])
+            op.grad = self.grad
+            self.ops[tensor_type] = op
+        return self.ops[tensor_type](x)
+
+softmax_grad = theano.tensor.nnet.nnet.SoftmaxGrad()
+softmax_op = theano.tensor.nnet.nnet.Softmax()
+
+class GuidedBackprop(ModifiedBackprop):
+    def grad(self, inp, grads):
+        x, = inp
+        g_sm, = grads
+        g_sm = g_sm * g_sm.shape[0].astype('float32') # Here I multiply to account for batch size division in
+                                                        # keras
+        sm = softmax_op(x)
+        grad = [softmax_grad(g_sm, sm)]
+        return grad
+
+mod_softmax = GuidedBackprop(softmax)
+
 print('Build model...')
 
 def hop_layer(x, u, adjacent=None):
@@ -179,23 +235,20 @@ def hop_layer(x, u, adjacent=None):
         Define one hop of the memory network
     '''
     if adjacent == None:
-        layer_encoder_m = SequenceEmbedding(input_dim=vocab_size,
-                                  output_dim=EMBED_HIDDEN_SIZE,
-                                  input_length=story_maxlen)
+        layer_encoder_m = Embedding(input_dim=vocab_size,
+                               output_dim=EMBED_HIDDEN_SIZE,
+                               input_length=story_maxlen, init='normal')
     else:
         layer_encoder_m = adjacent
-        
-    input_encoder_m = layer_encoder_m(x)
-    input_encoder_m = Dropout(0.3)(input_encoder_m)
-
-    layer_encoder_c = SequenceEmbedding(input_dim=vocab_size,
-                                  output_dim=EMBED_HIDDEN_SIZE,
-                                  input_length=story_maxlen)
-    input_encoder_c = layer_encoder_c(x)
-    input_encoder_c = Dropout(0.3)(input_encoder_c)
+    
 
     #output: (samples, max_len, embedding_size )    
     # Memory
+    input_encoder_m = layer_encoder_m(x)
+    input_encoder_m = Lambda(lambda x: K.sum(x, axis=2),
+                                 output_shape=(story_maxlen, EMBED_HIDDEN_SIZE,))(input_encoder_m)
+    #input_encoder_m = Dropout(0.3)(input_encoder_m)
+    
     memory = merge([input_encoder_m, u],
                     mode='dot',
                     dot_axes=[2, 1])
@@ -204,6 +257,18 @@ def hop_layer(x, u, adjacent=None):
     # output: (samples, max_len)
 
     # Output
+    layer_encoder_c = Embedding(input_dim=vocab_size,
+                               output_dim=EMBED_HIDDEN_SIZE,
+                               input_length=story_maxlen, init='normal')
+    
+    
+    
+    input_encoder_c = layer_encoder_c(x)
+    input_encoder_c = Lambda(lambda x: K.sum(x, axis=2),
+                                 output_shape=(story_maxlen, EMBED_HIDDEN_SIZE,))(input_encoder_c)
+    #input_encoder_c = LSTM(EMBED_HIDDEN_SIZE, return_sequences=True)(input_encoder_c) # this gives 1.0 acc 
+    #input_encoder_c = Dropout(0.3)(input_encoder_c)
+    
     output = merge([memory, input_encoder_c],
                   mode = 'dot',
                   dot_axes=[1,1])
@@ -213,32 +278,65 @@ def hop_layer(x, u, adjacent=None):
     return output, layers
 
 # 2 hop memn2n
-fact_input = Input(shape=(facts_maxlen, story_maxlen, ), dtype='int32', name='facts_input')
+fact_input = Input(shape=(story_maxlen, facts_maxlen, ), dtype='int32', name='facts_input')
 question_input = Input(shape=(query_maxlen, ), dtype='int32', name='query_input')
 
-question_encoder = Embedding(input_dim=vocab_size,
+question_layer = Embedding(input_dim=vocab_size,
                                output_dim=EMBED_HIDDEN_SIZE,
-                               input_length=query_maxlen)(question_input)
+                               input_length=query_maxlen, init='normal')
 
-question_encoder = Dropout(0.3)(question_encoder)
+question_encoder = question_layer(question_input)
+#question_encoder = Dropout(0.3)(question_encoder)
 question_encoder = Lambda(lambda x: K.sum(x, axis=1),
                          output_shape=lambda shape: (shape[0],) + shape[2:])(question_encoder)
 
-o1,layers = hop_layer(fact_input, question_encoder)
-o2,layers = hop_layer(fact_input, o1, adjacent=layers[0])
-o3,layers = hop_layer(fact_input, o2, adjacent=layers[0])
+o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer)
+o2,layers2 = hop_layer(fact_input, o1, adjacent=layers1[1])
+o3,layers3 = hop_layer(fact_input, o2, adjacent=layers2[1])
 
 # Response
-response = Dense(vocab_size, init='uniform',activation='softmax')(o3)
+response = Dense(vocab_size, init='normal',activation=mod_softmax, bias=False)(o3)
+response.W = layers3[1].W.T
 
 model = Model(input=[fact_input, question_input], output=[response])
 
+#theano.printing.pydotprint(response, outfile="model.png", var_with_name_simple=True)
+#plot(model, to_file='model.png')
+
+def scheduler(epoch):
+    if (epoch + 1) % 25 == 0:
+        lr_val = model.optimizer.lr.get_value()
+        model.optimizer.lr.set_value(lr_val*0.5)
+    return float(model.optimizer.lr.get_value())
+
+sgd = SGD(lr=0.01, clipnorm=40.)
+#adam = Adam(clipnorm = 40.)
+
+    
+class cleanEmbedding(Callback):
+    # Set to 0 the 0 index of embedding, as done in Weston matlab code, 
+    # too slow I should find another way
+    def on_train_begin(self, logs={}):
+        self.embedding_names = ['embedding_1','embedding_2', 'embedding_3', 'embedding_4']
+        self.embedding_layers = [model.get_layer(name) for name in self.embedding_names]
+        self.zeros_vector = T.zeros(EMBED_HIDDEN_SIZE, dtype='float32')
+    def on_batch_end(self, batch, logs={}):
+        for layer in self.embedding_layers:
+            update = (layer.W,T.set_subtensor(layer.W[0], self.zeros_vector))
+            theano.function([], updates=[update])()
+            
 print('Compiling model...')
-model.compile(loss='categorical_crossentropy', optimizer='rmsprop', metrics=['accuracy'])
+model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=[categorical_accuracy])
 print('Compilation done...')
 
-# Note: you could use a Graph model to avoid repeat the input twice
+lr_schedule = LearningRateScheduler(scheduler)
+clean = cleanEmbedding()
+
 model.fit([inputs_train, queries_train], answers_train,
            batch_size=32,
-           nb_epoch=120,
-           validation_data=([inputs_test, queries_test], answers_test))
+           nb_epoch=100,
+           validation_split=0.1,
+           callbacks=[lr_schedule, clean])
+loss, acc = model.evaluate([inputs_test, queries_test], answers_test)
+
+print (loss,acc)
