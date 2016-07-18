@@ -10,7 +10,7 @@
 from __future__ import print_function
 from keras.utils.data_utils import get_file
 from keras.layers.embeddings import Embedding
-from keras.layers.core import Dense, Merge, Dropout, RepeatVector, Lambda, Permute, Activation
+from keras.layers.core import Dense, Merge, Dropout, RepeatVector, Lambda, Permute, Activation, Masking
 from keras.layers import recurrent, Input, merge
 from keras.layers.recurrent import LSTM, GRU
 from keras.models import Sequential, Model
@@ -37,12 +37,21 @@ import pdb
 class SequenceEmbedding(Embedding):
     def __init__(self, input_dim, output_dim, position_encoding=False, **kwargs):
         self.position_encoding = position_encoding
+        self.zeros_vector =  T.zeros(output_dim, dtype='float32').reshape((1,output_dim))
         super(SequenceEmbedding, self).__init__(input_dim, output_dim, **kwargs)
     
-    
+ 
     def call(self, x, mask=None):
-        out = super(SequenceEmbedding, self).call(x, mask=mask)
-        return K.sum(out, axis=2)
+        if 0. < self.dropout < 1.:
+            retain_p = 1. - self.dropout
+            B = K.random_binomial((self.input_dim,), p=retain_p) * (1. / retain_p)
+            B = K.expand_dims(B)
+            W = K.in_train_phase(self.W * B, self.W)
+        else:
+            W = self.W
+        W_ = T.concatenate([self.zeros_vector, W], axis=0)
+        out = K.gather(W_, x)
+        return out
 
 def tokenize(sent):
     '''Return the tokens of a sentence including punctuation.
@@ -131,7 +140,7 @@ challenges = {
     'three_supporting_facts_10k': 'tasks_1-20_v1-2/en/qa3_three-supporting-facts_{}.txt',
 
 }
-challenge_type = 'single_supporting_fact_10k'
+challenge_type = 'two_supporting_facts_10k'
 challenge = challenges[challenge_type]
 
 EMBED_HIDDEN_SIZE = 20
@@ -230,12 +239,12 @@ mod_softmax = GuidedBackprop(softmax)
 
 print('Build model...')
 
-def hop_layer(x, u, adjacent=None):
+def hop_layer(x, u, adjacent=None, input_layer=False):
     '''
         Define one hop of the memory network
     '''
     if adjacent == None:
-        layer_encoder_m = Embedding(input_dim=vocab_size,
+        layer_encoder_m = SequenceEmbedding(input_dim=vocab_size-1,
                                output_dim=EMBED_HIDDEN_SIZE,
                                input_length=story_maxlen, init='normal')
     else:
@@ -245,6 +254,7 @@ def hop_layer(x, u, adjacent=None):
     #output: (samples, max_len, embedding_size )    
     # Memory
     input_encoder_m = layer_encoder_m(x)
+        
     input_encoder_m = Lambda(lambda x: K.sum(x, axis=2),
                                  output_shape=(story_maxlen, EMBED_HIDDEN_SIZE,))(input_encoder_m)
     #input_encoder_m = Dropout(0.3)(input_encoder_m)
@@ -257,7 +267,7 @@ def hop_layer(x, u, adjacent=None):
     # output: (samples, max_len)
 
     # Output
-    layer_encoder_c = Embedding(input_dim=vocab_size,
+    layer_encoder_c = SequenceEmbedding(input_dim=vocab_size-1,
                                output_dim=EMBED_HIDDEN_SIZE,
                                input_length=story_maxlen, init='normal')
     
@@ -281,7 +291,9 @@ def hop_layer(x, u, adjacent=None):
 fact_input = Input(shape=(story_maxlen, facts_maxlen, ), dtype='int32', name='facts_input')
 question_input = Input(shape=(query_maxlen, ), dtype='int32', name='query_input')
 
-question_layer = Embedding(input_dim=vocab_size,
+# input_length is different to input, so is not clear if I can share it, however this still 
+# work because embedding layer does not check that
+question_layer = SequenceEmbedding(input_dim=vocab_size-1,
                                output_dim=EMBED_HIDDEN_SIZE,
                                input_length=query_maxlen, init='normal')
 
@@ -290,13 +302,21 @@ question_encoder = question_layer(question_input)
 question_encoder = Lambda(lambda x: K.sum(x, axis=1),
                          output_shape=lambda shape: (shape[0],) + shape[2:])(question_encoder)
 
-o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer)
+#input_layer = Embedding(input_dim=vocab_size,
+#                               output_dim=EMBED_HIDDEN_SIZE,
+#                               input_length=story_maxlen, init='normal')
+#input_layer.W = question_layer.W
+#input_layer.trainable_weights = [input_layer.W]
+
+o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer, input_layer=True)
 o2,layers2 = hop_layer(fact_input, o1, adjacent=layers1[1])
 o3,layers3 = hop_layer(fact_input, o2, adjacent=layers2[1])
 
 # Response
 response = Dense(vocab_size, init='normal',activation=mod_softmax, bias=False)(o3)
-response.W = layers3[1].W.T
+# This is not the way to do it
+#response.W = layers3[1].W.T
+#response.trainable_weights = [response.W]
 
 model = Model(input=[fact_input, question_input], output=[response])
 
@@ -311,32 +331,20 @@ def scheduler(epoch):
 
 sgd = SGD(lr=0.01, clipnorm=40.)
 #adam = Adam(clipnorm = 40.)
-
-    
-class cleanEmbedding(Callback):
-    # Set to 0 the 0 index of embedding, as done in Weston matlab code, 
-    # too slow I should find another way
-    def on_train_begin(self, logs={}):
-        self.embedding_names = ['embedding_1','embedding_2', 'embedding_3', 'embedding_4']
-        self.embedding_layers = [model.get_layer(name) for name in self.embedding_names]
-        self.zeros_vector = T.zeros(EMBED_HIDDEN_SIZE, dtype='float32')
-    def on_batch_end(self, batch, logs={}):
-        for layer in self.embedding_layers:
-            update = (layer.W,T.set_subtensor(layer.W[0], self.zeros_vector))
-            theano.function([], updates=[update])()
             
 print('Compiling model...')
 model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=[categorical_accuracy])
 print('Compilation done...')
 
+
 lr_schedule = LearningRateScheduler(scheduler)
-clean = cleanEmbedding()
 
 model.fit([inputs_train, queries_train], answers_train,
            batch_size=32,
            nb_epoch=100,
            validation_split=0.1,
-           callbacks=[lr_schedule, clean])
+           callbacks=[lr_schedule],
+           verbose=1)
 loss, acc = model.evaluate([inputs_test, queries_test], answers_test)
 
 print (loss,acc)
