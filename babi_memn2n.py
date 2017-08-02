@@ -34,6 +34,16 @@ import numpy as np
 import re
 import pdb
 
+from itertools import izip_longest
+
+from os import listdir
+from os.path import isfile, join
+
+def grouper(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return izip_longest(*args, fillvalue=fillvalue)
+
+
 class SequenceEmbedding(Embedding):
     def __init__(self, input_dim, output_dim, position_encoding=False, **kwargs):
         self.position_encoding = position_encoding
@@ -121,6 +131,9 @@ def vectorize_facts(data, word_idx, story_maxlen, query_maxlen, fact_maxlen, ena
         Y.append(y)
     return pad_sequences(X, maxlen=story_maxlen), pad_sequences(Xq, maxlen=query_maxlen), np.array(Y)
 
+np.random.seed(1234)
+#random.seed(1234)
+
 '''
 try:
     path = get_file('babi-tasks-v1-2.tar.gz', origin='http://www.thespermwhale.com/jaseweston/babi/tasks_1-20_v1-2.tar.gz')
@@ -134,21 +147,43 @@ tar = tarfile.open('babi-tasks-v1-2.tar.gz')
 
 challenges = {
     # QA1 with 10,000 samples
-    'single_supporting_fact_10k': 'tasks_1-20_v1-2/en/qa1_single-supporting-fact_{}.txt',
+    'single_supporting_fact_10k': 'tasks_1-20_v1-2/en-10k/qa1_single-supporting-fact_{}.txt',
     # QA2 with 10,000 samples
     'two_supporting_facts_10k': 'tasks_1-20_v1-2/en/qa2_two-supporting-facts_{}.txt',
     'three_supporting_facts_10k': 'tasks_1-20_v1-2/en/qa3_three-supporting-facts_{}.txt',
 
 }
-challenge_type = 'two_supporting_facts_10k'
-challenge = challenges[challenge_type]
+#challenge_type = 'single_supporting_fact_10k'
+#challenge = challenges[challenge_type]
+# Reading all file names
+mypath = 'tasks_1-20_v1-2/en'
+challenge_files = [f for f in listdir(mypath) if isfile(join(mypath, f))]
+challenge_files = ['tasks_1-20_v1-2/en-10k/' + f.replace('train', '{}') for f 
+                   in challenge_files if 'train.txt' == f[-9:]]
+
+# Read all files
+train_facts_split = []
+test_facts_split = []
+train_facts = []
+test_facts = []
+for challenge in challenge_files:
+    train_facts_split.append(get_stories(tar.extractfile(challenge.format('train'))))
+    test_facts_split.append(get_stories(tar.extractfile(challenge.format('test'))))
+    train_facts += train_facts_split[-1]
+    test_facts += test_facts_split[-1]
+
+test_facts = np.array(test_facts)
+train_facts = np.array(train_facts)
+test_facts = list(test_facts[np.random.choice(len(test_facts), len(test_facts), replace=False)])
+train_facts = list(train_facts[np.random.choice(len(train_facts), len(train_facts), replace=False)])
+
 
 EMBED_HIDDEN_SIZE = 20
 enable_time = True
 
-print('Extracting stories for the challenge:', challenge_type)
-train_facts = get_stories(tar.extractfile(challenge.format('train')))
-test_facts = get_stories(tar.extractfile(challenge.format('test')))
+#print('Extracting stories for the challenge:', challenge_type)
+#train_facts = get_stories(tar.extractfile(challenge.format('train')))
+#test_facts = get_stories(tar.extractfile(challenge.format('test')))
 
 train_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in train_facts]
 test_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in test_facts]
@@ -163,8 +198,6 @@ query_maxlen = max(map(len, (x for _, x, _ in train_facts + test_facts)))
 vocab = sorted(reduce(lambda x, y: x | y, (set(story + q + [answer]) for story, q, answer in train_stories + test_stories)))
 # Reserve 0 for masking via pad_sequences
 vocab_size = len(vocab) + 1
-if enable_time:
-    vocab_size += story_maxlen
 
 print('-')
 print('Vocab size:', vocab_size, 'unique words')
@@ -177,6 +210,12 @@ print('Here\'s what a "story" tuple looks like (input, query, answer):')
 print(train_stories[0])
 print('-')
 print('Vectorizing the word sequences...')
+
+#facts_maxlen = query_maxlen = max(facts_maxlen, query_maxlen)
+story_maxlen = 20 
+
+if enable_time:
+    vocab_size += story_maxlen
 
 word_idx = dict((c, i + 1) for i, c in enumerate(vocab))
 inputs_train, queries_train, answers_train = vectorize_facts(train_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
@@ -239,7 +278,7 @@ mod_softmax = GuidedBackprop(softmax)
 
 print('Build model...')
 
-def hop_layer(x, u, adjacent=None, input_layer=False):
+def hop_layer(x, u, adjacent=None, input_layer=False, use_softmax=True):
     '''
         Define one hop of the memory network
     '''
@@ -262,7 +301,10 @@ def hop_layer(x, u, adjacent=None, input_layer=False):
     memory = merge([input_encoder_m, u],
                     mode='dot',
                     dot_axes=[2, 1])
-    layer_memory = Lambda(lambda x: K.softmax(x))
+    if use_softmax:
+        layer_memory = Lambda(lambda x: K.softmax(x))
+    else:
+        layer_memory = Lambda(lambda x: x)
     memory = layer_memory(memory)
     # output: (samples, max_len)
 
@@ -270,8 +312,6 @@ def hop_layer(x, u, adjacent=None, input_layer=False):
     layer_encoder_c = SequenceEmbedding(input_dim=vocab_size-1,
                                output_dim=EMBED_HIDDEN_SIZE,
                                input_length=story_maxlen, init='normal')
-    
-    
     
     input_encoder_c = layer_encoder_c(x)
     input_encoder_c = Lambda(lambda x: K.sum(x, axis=2),
@@ -308,13 +348,15 @@ question_encoder = Lambda(lambda x: K.sum(x, axis=1),
 #input_layer.W = question_layer.W
 #input_layer.trainable_weights = [input_layer.W]
 
-o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer, input_layer=True)
-o2,layers2 = hop_layer(fact_input, o1, adjacent=layers1[1])
-o3,layers3 = hop_layer(fact_input, o2, adjacent=layers2[1])
+o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer, input_layer=True,
+                      use_softmax=False)
+o2,layers2 = hop_layer(fact_input, o1, adjacent=layers1[1], use_softmax=False)
+o3,layers3 = hop_layer(fact_input, o2, adjacent=layers2[1], use_softmax=False)
 
 # Response
-response = Dense(vocab_size, init='normal',activation=mod_softmax, bias=False)(o3)
+response = Dense(vocab_size, init='normal', activation=mod_softmax, bias=False)(o3)
 # This is not the way to do it
+# TODO: Share softmax weights with input weights
 #response.W = layers3[1].W.T
 #response.trainable_weights = [response.W]
 
@@ -324,27 +366,102 @@ model = Model(input=[fact_input, question_input], output=[response])
 #plot(model, to_file='model.png')
 
 def scheduler(epoch):
-    if (epoch + 1) % 25 == 0:
+    if (epoch + 1) % 10 == 0:
         lr_val = model.optimizer.lr.get_value()
         model.optimizer.lr.set_value(lr_val*0.5)
     return float(model.optimizer.lr.get_value())
 
-sgd = SGD(lr=0.01, clipnorm=40.)
+sgd = SGD(lr=0.005, clipnorm=40.)
 #adam = Adam(clipnorm = 40.)
             
 print('Compiling model...')
+        
 model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=[categorical_accuracy])
 print('Compilation done...')
 
 
-lr_schedule = LearningRateScheduler(scheduler)
+# Train / Validation Split
+choices = np.random.choice(len(train_facts), len(train_facts), replace=False)
+train_facts = np.array(train_facts)
+valid_facts = train_facts[choices[-len(train_facts)*0.1:]]
+train_facts = train_facts[choices[:len(train_facts)*0.9]]
 
-model.fit([inputs_train, queries_train], answers_train,
-           batch_size=32,
-           nb_epoch=100,
-           validation_split=0.1,
-           callbacks=[lr_schedule],
-           verbose=1)
-loss, acc = model.evaluate([inputs_test, queries_test], answers_test)
+inputs_valid, queries_valid, answers_valid = vectorize_facts(valid_facts, word_idx, 
+                                                             story_maxlen, query_maxlen, facts_maxlen,
+                                                             enable_time=enable_time)
 
-print (loss,acc)
+BATCH_SIZE = 32
+
+show_batch_interval = 1000
+
+linear_regime = True
+
+EPOCHS = 50
+N_BATCHS = len(train_facts) // BATCH_SIZE
+EARLY_STOP_MAX = 4
+
+save_hist = []
+save_hist.append(0.)
+
+for k in xrange(EPOCHS):
+    for b,batch in enumerate(grouper(train_facts, BATCH_SIZE, fillvalue=train_facts[-1])):
+        inputs_train, queries_train, answers_train = vectorize_facts(batch, word_idx, 
+                                                                     story_maxlen, query_maxlen, facts_maxlen,
+                                                                     enable_time=enable_time)
+        loss = model.train_on_batch([inputs_train, queries_train], answers_train)
+        if b % show_batch_interval == 0:
+            print('Epoch: {0}, Batch: {1}, loss: {2} - acc: {3}'.format(k, 
+                                                                        b, float(loss[0]), float(loss[1])))
+
+    losses = model.evaluate([inputs_valid, queries_valid], answers_valid, batch_size=BATCH_SIZE, 
+                            verbose=0)
+    print('Epoch {0}, valid loss / valid accuracy: {1} / {2}'.
+           format(k, losses[0], losses[1]))
+    
+       
+    #Saving model
+    if max(save_hist) < losses[1]:
+        model.save_weights('models/weights_memn2n.hdf5', overwrite=True)
+    save_hist.append(losses[1])
+    
+    if max(save_hist) > losses[1] and linear_regime:
+        print ('Changing from linear regime ...')
+        o1,layers1 = hop_layer(fact_input, question_encoder, adjacent=question_layer, input_layer=True)
+        o2,layers2 = hop_layer(fact_input, o1, adjacent=layers1[1])
+        o3,layers3 = hop_layer(fact_input, o2, adjacent=layers2[1])
+
+        response = Dense(vocab_size, init='normal', activation=mod_softmax, bias=False)(o3)
+
+        model = Model(input=[fact_input, question_input], output=[response])
+        model.load_weights('models/weights_memn2n.hdf5')
+        sgd = SGD(lr=0.01, clipnorm=40.)
+    
+        model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=[categorical_accuracy])
+        linear_regime = False
+        k = 0
+        print ('Done.')
+
+    if max(save_hist) > losses[1]:
+        early_stop += 1
+    else:
+        early_stop = 0
+    # Reduce attention loss weights at each early stop call (only two times)
+    #if early_stop >= EARLY_STOP_MAX:
+    #    break
+    scheduler(k)
+
+
+print('Total Model Accuracy: ')
+loss, acc = model.evaluate([inputs_test, queries_test], answers_test, verbose=2)
+print('Loss: {0}, Acc: {1}'.format(loss, acc))
+print('Per-Task Accuracy: ')
+passed = 0
+for k, challenge in enumerate(challenge_files):
+    test_fact = test_facts_split[k]
+    print(challenge)
+    inputs_test, queries_test, answers_test = vectorize_facts(test_fact, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                         enable_time=enable_time)
+    loss, acc = model.evaluate([inputs_test, queries_test], answers_test,  verbose=2)
+    print('\n Loss: {0}, Acc: {1}, Pass: {2} '.format(loss, acc, acc >= 0.95))
+    passed += acc >= 0.95
+print ('Passed: {0}'.format(passed))

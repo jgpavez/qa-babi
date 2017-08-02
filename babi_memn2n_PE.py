@@ -10,12 +10,19 @@
 from __future__ import print_function
 from keras.utils.data_utils import get_file
 from keras.layers.embeddings import Embedding
-from keras.layers.core import Dense, Merge, Dropout, RepeatVector, Lambda, Permute, Activation
+from keras.layers.core import Dense, Merge, Dropout, RepeatVector, Lambda, Permute, Activation, Masking
 from keras.layers import recurrent, Input, merge
 from keras.layers.recurrent import LSTM, GRU
 from keras.models import Sequential, Model
 from keras.preprocessing.sequence import pad_sequences
-from keras.callbacks import ModelCheckpoint, Callback
+from keras.callbacks import ModelCheckpoint, Callback, LearningRateScheduler
+from keras.optimizers import SGD, Adam
+from keras.activations import softmax
+from keras.metrics import categorical_accuracy
+import keras.backend as K
+from keras.utils.visualize_util import plot
+import theano.tensor as T
+import theano
 import keras.backend as K
 
 from keras import initializations, regularizers, constraints
@@ -28,15 +35,28 @@ np.random.seed(1337)  # for reproducibility
 import re
 import pdb
 
+from os import listdir
+from os.path import isfile, join
+
 class SequenceEmbedding(Embedding):
     def __init__(self, input_dim, output_dim, position_encoding=False, **kwargs):
         self.position_encoding = position_encoding
+        self.zeros_vector =  T.zeros(output_dim, dtype='float32').reshape((1,output_dim))
         super(SequenceEmbedding, self).__init__(input_dim, output_dim, **kwargs)
     
-    
+ 
     def call(self, x, mask=None):
-        out = super(SequenceEmbedding, self).call(x, mask=mask)
-        return K.sum(out, axis=2)
+        if 0. < self.dropout < 1.:
+            retain_p = 1. - self.dropout
+            B = K.random_binomial((self.input_dim,), p=retain_p) * (1. / retain_p)
+            B = K.expand_dims(B)
+            W = K.in_train_phase(self.W * B, self.W)
+        else:
+            W = self.W
+        W_ = T.concatenate([self.zeros_vector, W], axis=0)
+        out = K.gather(W_, x)
+        return out
+
 
 def tokenize(sent):
     '''Return the tokens of a sentence including punctuation.
@@ -44,6 +64,7 @@ def tokenize(sent):
     ['Bob', 'dropped', 'the', 'apple', '.', 'Where', 'is', 'the', 'apple', '?']
     '''
     return [x.strip() for x in re.split('(\W+)?', sent) if x.strip()]
+
 
 
 def parse_stories(lines, only_supporting=False):
@@ -69,11 +90,11 @@ def parse_stories(lines, only_supporting=False):
             else:
                 # Provide all the substories
                 substory = [x for x in story if x]
-            data.append((substory, q, a))
+            data.append((substory, q[:-1], a))
             story.append('')
         else:
             sent = tokenize(line)
-            story.append([sent])
+            story.append([sent[:-1]])
     return data
 
 
@@ -86,26 +107,31 @@ def get_stories(f, only_supporting=False, max_length=None):
     data = [(flatten(story), q, answer) for story, q, answer in data if not max_length or len(flatten(story)) < max_length]
     return data
 
-def vectorize_facts(data, word_idx, story_maxlen, query_maxlen, fact_maxlen):
+def vectorize_facts(data, word_idx, story_maxlen, query_maxlen, fact_maxlen, enable_time = False):
     X = []
     Xq = []
     Y = []
     for story, query, answer in data:
-        x = []
+        x = np.zeros((len(story), fact_maxlen),dtype='int32')
         for k,facts in enumerate(story):
-            x.append(np.array([word_idx[w] for w in facts])[:fact_maxlen])
+            if not enable_time:
+                x[k][-len(facts):] = np.array([word_idx[w] for w in facts])[:fact_maxlen]
+            else:
+                x[k][-len(facts)-1:-1] = np.array([word_idx[w] for w in facts])[:facts_maxlen-1]
+                x[k][-1] = len(word_idx) + len(story) - k
         xq = [word_idx[w] for w in query]
-        y = np.zeros(len(word_idx) + 1)
+        y = np.zeros(len(word_idx) + 1) if not enable_time else np.zeros(len(word_idx) + 1 + story_maxlen)
         y[word_idx[answer]] = 1
         X.append(x)
         Xq.append(xq)
         Y.append(y)
-    return X, pad_sequences(Xq, maxlen=query_maxlen), np.array(Y)
+    return pad_sequences(X, maxlen=story_maxlen), pad_sequences(Xq, maxlen=query_maxlen), np.array(Y)
 
 def LJD (J, d): 
     j, k = np.indices((J,d),dtype='float32') + 1.
     L = (1 - j/J) - (k/d)*(1 - 2*j/J)
     return L
+
 def PE_matrix(inputs_test):
     L = []
     for facts in inputs_test:
@@ -144,14 +170,37 @@ challenges = {
     # QA2 with 10,000 samples
     'two_supporting_facts_10k': 'tasks_1-20_v1-2/en-10k/qa2_two-supporting-facts_{}.txt',
 }
-challenge_type = 'single_supporting_fact_10k'
-challenge = challenges[challenge_type]
+#challenge_type = 'single_supporting_fact_10k'
+#challenge = challenges[challenge_type]
+mypath = 'tasks_1-20_v1-2/en'
+challenge_files = [f for f in listdir(mypath) if isfile(join(mypath, f))]
+challenge_files = ['tasks_1-20_v1-2/en-10k/' + f.replace('train', '{}') for f 
+                   in challenge_files if 'train.txt' == f[-9:]]
 
-EMBED_HIDDEN_SIZE = 64
+# Read all files
+train_facts_split = []
+test_facts_split = []
+train_facts = []
+test_facts = []
+for challenge in challenge_files:
+    train_facts_split.append(get_stories(tar.extractfile(challenge.format('train'))))
+    test_facts_split.append(get_stories(tar.extractfile(challenge.format('test'))))
+    train_facts += train_facts_split[-1]
+    test_facts += test_facts_split[-1]
 
-print('Extracting stories for the challenge:', challenge_type)
-train_facts = get_stories(tar.extractfile(challenge.format('train')))
-test_facts = get_stories(tar.extractfile(challenge.format('test')))
+test_facts = np.array(test_facts)
+train_facts = np.array(train_facts)
+test_facts = list(test_facts[np.random.choice(len(test_facts), len(test_facts), replace=False)])
+train_facts = list(train_facts[np.random.choice(len(train_facts), len(train_facts), replace=False)])
+
+
+EMBED_HIDDEN_SIZE = 20
+enable_time = True
+
+
+#print('Extracting stories for the challenge:', challenge_type)
+#train_facts = get_stories(tar.extractfile(challenge.format('train')))
+#test_facts = get_stories(tar.extractfile(challenge.format('test')))
 
 train_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in train_facts]
 test_stories = [(reduce(lambda x,y: x + y, map(list,fact)),q,a) for fact,q,a in test_facts]
@@ -161,6 +210,8 @@ vocab = sorted(reduce(lambda x, y: x | y, (set(story + q + [answer]) for story, 
 vocab_size = len(vocab) + 1
 
 facts_maxlen = max(map(len, (x for h,_,_ in train_facts + test_facts for x in h)))
+if enable_time:
+    facts_maxlen += 1
 
 story_maxlen = max(map(len, (x for x, _, _ in train_facts + test_facts)))
 query_maxlen = max(map(len, (x for _, x, _ in train_facts + test_facts)))
@@ -178,9 +229,16 @@ print(train_stories[0])
 print('-')
 print('Vectorizing the word sequences...')
 
+#facts_maxlen = query_maxlen = max(facts_maxlen, query_maxlen)
+story_maxlen = 20 
+if enable_time:
+    vocab_size += story_maxlen
+    
 word_idx = dict((c, i + 1) for i, c in enumerate(vocab))
-inputs_train, queries_train, answers_train = vectorize_facts(train_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen)
-inputs_test, queries_test, answers_test = vectorize_facts(test_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen)
+inputs_train, queries_train, answers_train = vectorize_facts(train_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                            enable_time=enable_time)
+inputs_test, queries_test, answers_test = vectorize_facts(test_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                         enable_time=enable_time)
 
 print('-')
 print('inputs: integer tensor of shape (samples, max_length)')
@@ -198,6 +256,44 @@ print('-')
 print('Compiling...')
 
 print('Build model...')
+
+# This is a trick to avoid batch size average of error in training, 
+# such as is done in Weston's code with size_average = False
+class ModifiedBackprop(object):
+
+    def __init__(self, nonlinearity):
+        self.nonlinearity = nonlinearity
+        self.ops = {}  # memoizes an OpFromGraph instance per tensor type
+
+    def __call__(self, x):
+        if theano.sandbox.cuda.cuda_enabled:
+            maybe_to_gpu = theano.sandbox.cuda.as_cuda_ndarray_variable
+        else:
+            maybe_to_gpu = lambda x: x
+        x = maybe_to_gpu(x)
+        tensor_type = x.type
+        if tensor_type not in self.ops:
+            inp = tensor_type()
+            outp = maybe_to_gpu(self.nonlinearity(inp))
+            op = theano.OpFromGraph([inp], [outp])
+            op.grad = self.grad
+            self.ops[tensor_type] = op
+        return self.ops[tensor_type](x)
+
+softmax_grad = theano.tensor.nnet.nnet.SoftmaxGrad()
+softmax_op = theano.tensor.nnet.nnet.Softmax()
+
+class GuidedBackprop(ModifiedBackprop):
+    def grad(self, inp, grads):
+        x, = inp
+        g_sm, = grads
+        g_sm = g_sm * g_sm.shape[0].astype('float32') # Here I multiply to account for batch size division in
+                                                        # keras
+        sm = softmax_op(x)
+        grad = [softmax_grad(g_sm, sm)]
+        return grad
+
+mod_softmax = GuidedBackprop(softmax)
 
 def position_encoder(input_layer, PE_input):
     layer_encoder = Embedding(input_dim=vocab_size,
@@ -275,16 +371,18 @@ question_encoder = Lambda(lambda x: K.sum(x, axis=1),
 PE_input = Input(shape=(story_maxlen, facts_maxlen, EMBED_HIDDEN_SIZE,), dtype='float32', name='PE_input')
 o1,layers = hop_layer(fact_input, question_encoder, pos_encoder=PE_input)
 
-#o2,layers = hop_layer(fact_input, o1, adjacent=layers[0])
-#o3,layers = hop_layer(fact_input, o2, adjacent=layers[0])
+o2,layers_1 = hop_layer(fact_input, o1, adjacent=layers[0], pos_encoder=PE_input)
+o3,layers_2 = hop_layer(fact_input, o2, adjacent=layers_1[0], pos_encoder=PE_input)
 
 # Response
-response = Dense(vocab_size, init='uniform',activation='softmax')(o1)
+response = Dense(vocab_size, init='normal',activation=mod_softmax, bias=False)(o3)
 
 model = Model(input=[fact_input, PE_input, question_input], output=[response])
 
+sgd = SGD(lr=0.01, clipnorm=40.)
+
 print('Compiling model...')
-model.compile(loss='categorical_crossentropy', optimizer='rmsprop', metrics=['accuracy'])
+model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
 print('Compilation done...')
 
 print('Computing PE matrix')
@@ -292,12 +390,42 @@ PE_mat_train = PE_matrix(inputs_train)
 inputs_train_p = pad_set(inputs_train, story_maxlen, facts_maxlen)
 PE_mat_train_p = pad_set(PE_mat_train, story_maxlen, facts_maxlen)
 
-PE_mat_test = PE_matrix(inputs_test)
-inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
-PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
+def scheduler(epoch):
+    if (epoch + 1) % 20 == 0:
+        lr_val = model.optimizer.lr.get_value()
+        model.optimizer.lr.set_value(lr_val*0.5)
+    return float(model.optimizer.lr.get_value())
+
+lr_schedule = LearningRateScheduler(scheduler)
 
 # Note: you could use a Graph model to avoid repeat the input twice
 model.fit([inputs_train_p, PE_mat_train_p, queries_train], answers_train,
            batch_size=32,
-           nb_epoch=120,
-           validation_data=([inputs_test_p, PE_mat_test_p, queries_test], answers_test))
+           nb_epoch=100,
+           validation_split=0.1,
+           callbacks=[lr_schedule],
+           verbose=2)
+
+PE_mat_test = PE_matrix(inputs_test)
+inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
+PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
+
+print('Total Model Accuracy: ')
+loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test], answers_test, verbose=2)
+print('Loss: {0}, Acc: {1}'.format(loss, acc))
+print('Per-Task Accuracy: ')
+passed = 0
+for k, challenge in enumerate(challenge_files):
+    test_fact = test_facts_split[k]
+    print(challenge)
+    inputs_test, queries_test, answers_test = vectorize_facts(test_fact, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                         enable_time=enable_time)
+
+    PE_mat_test = PE_matrix(inputs_test)
+    inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
+    PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
+
+    loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test], answers_test,  verbose=2)
+    print('\n Loss: {0}, Acc: {1}, Pass: {2} '.format(loss, acc, acc >= 0.95))
+    passed += acc >= 0.95
+print ('Passed: {0}'.format(passed))
