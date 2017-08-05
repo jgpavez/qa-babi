@@ -35,8 +35,14 @@ np.random.seed(1337)  # for reproducibility
 import re
 import pdb
 
+from itertools import izip_longest
+
 from os import listdir
 from os.path import isfile, join
+
+def grouper(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return izip_longest(*args, fillvalue=fillvalue)
 
 class SequenceEmbedding(Embedding):
     def __init__(self, input_dim, output_dim, position_encoding=False, **kwargs):
@@ -141,17 +147,35 @@ def PE_matrix(inputs_test):
         L.append(Li)
     return L
 
-def pad_set(data,story_maxlen,fact_maxlen):
+def PE_matrix_q(inputs_test):
+    L = []
+    for fact in inputs_test:
+        Li = LJD(len(fact), EMBED_HIDDEN_SIZE)
+        L.append(Li)
+    return L
+
+def pad_set(data, story_maxlen, fact_maxlen):
     X = []
     for story in data:
         if len(story[0].shape) == 1:
-            x = np.zeros((len(story), fact_maxlen),dtype='int32')
+            x = np.zeros((len(story), fact_maxlen), dtype='int32')
         else:
             x = np.zeros((len(story), fact_maxlen, story[0].shape[1]), dtype='float32')
         for k,facts in enumerate(story):
             x[k][-len(facts):] = facts
         X.append(x)
     return pad_sequences(X, maxlen=story_maxlen, dtype=data[0][0].dtype)
+
+def pad_set_q(data, query_maxlen):
+    X = []
+    for q in data:
+        if len(q.shape) == 1:
+            x = np.zeros((len(q)),dtype='int32')
+        else:
+            x = np.zeros((len(q), q.shape[1]), dtype='float32')
+        x[-len(q):] = q
+        X.append(x)
+    return np.array(X)
 
 '''
 try:
@@ -162,6 +186,8 @@ except:
           '$ mv tasks_1-20_v1-2.tar.gz ~/.keras/datasets/babi-tasks-v1-2.tar.gz')
     raise
 '''
+np.random.seed(1234)
+
 tar = tarfile.open('babi-tasks-v1-2.tar.gz')
 
 challenges = {
@@ -196,7 +222,6 @@ train_facts = list(train_facts[np.random.choice(len(train_facts), len(train_fact
 
 EMBED_HIDDEN_SIZE = 20
 enable_time = True
-
 
 #print('Extracting stories for the challenge:', challenge_type)
 #train_facts = get_stories(tar.extractfile(challenge.format('train')))
@@ -309,7 +334,7 @@ def position_encoder(input_layer, PE_input):
                                output_shape=(story_maxlen, EMBED_HIDDEN_SIZE,))(position_encoding)
     return position_encoding, layer_encoder
 
-def hop_layer(x, u, adjacent=None, pos_encoder=None):
+def hop_layer(x, u, adjacent=None, pos_encoder=None, use_softmax=True):
     '''
         Define one hop of the memory network
     '''
@@ -342,7 +367,10 @@ def hop_layer(x, u, adjacent=None, pos_encoder=None):
     memory = merge([input_encoder_m, u],
                     mode='dot',
                     dot_axes=[2, 1])
-    layer_memory = Lambda(lambda x: K.softmax(x))
+    if use_softmax:
+        layer_memory = Lambda(lambda x: K.softmax(x))
+    else:
+        layer_memory = Lambda(lambda x: x)
     memory = layer_memory(memory)
     # output: (samples, max_len)
 
@@ -355,40 +383,46 @@ def hop_layer(x, u, adjacent=None, pos_encoder=None):
     layers = [layer_encoder_m, layer_encoder_c, layer_memory]
     return output, layers
 
+
 # 2 hop memn2n
 fact_input = Input(shape=(story_maxlen, facts_maxlen, ), dtype='int32', name='facts_input')
 question_input = Input(shape=(query_maxlen, ), dtype='int32', name='query_input')
 
+
+PE_input = Input(shape=(story_maxlen, facts_maxlen, EMBED_HIDDEN_SIZE,), dtype='float32', name='PE_input')
+
+PE_question = Input(shape=(query_maxlen, EMBED_HIDDEN_SIZE,), dtype='float32', name='PE_question')
+
+# TODO: Encode question with PE encoding
 question_encoder = Embedding(input_dim=vocab_size,
                                output_dim=EMBED_HIDDEN_SIZE,
                                input_length=query_maxlen)(question_input)
+
+question_encoder = Lambda(lambda x: x, 
+                       output_shape=(query_maxlen, EMBED_HIDDEN_SIZE,))(question_encoder)
+q_position_encoding = merge([question_encoder, PE_question],'mul')
 
 #question_encoder = Dropout(0.3)(question_encoder)
 question_encoder = Lambda(lambda x: K.sum(x, axis=1),
                          output_shape=lambda shape: (shape[0],) + shape[2:])(question_encoder)
 
 
-PE_input = Input(shape=(story_maxlen, facts_maxlen, EMBED_HIDDEN_SIZE,), dtype='float32', name='PE_input')
-o1,layers = hop_layer(fact_input, question_encoder, pos_encoder=PE_input)
+o1,layers = hop_layer(fact_input, question_encoder, pos_encoder=PE_input, use_softmax=False)
 
-o2,layers_1 = hop_layer(fact_input, o1, adjacent=layers[0], pos_encoder=PE_input)
-o3,layers_2 = hop_layer(fact_input, o2, adjacent=layers_1[0], pos_encoder=PE_input)
+o2,layers_1 = hop_layer(fact_input, o1, adjacent=layers[0], pos_encoder=PE_input, use_softmax=False)
+o3,layers_2 = hop_layer(fact_input, o2, adjacent=layers_1[0], pos_encoder=PE_input, use_softmax=False)
 
 # Response
 response = Dense(vocab_size, init='normal',activation=mod_softmax, bias=False)(o3)
 
-model = Model(input=[fact_input, PE_input, question_input], output=[response])
+model = Model(input=[fact_input, PE_input, question_input, PE_question], output=[response])
 
-sgd = SGD(lr=0.01, clipnorm=40.)
+sgd = SGD(lr=0.005, clipnorm=40.)
 
 print('Compiling model...')
 model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
 print('Compilation done...')
 
-print('Computing PE matrix')
-PE_mat_train = PE_matrix(inputs_train)
-inputs_train_p = pad_set(inputs_train, story_maxlen, facts_maxlen)
-PE_mat_train_p = pad_set(PE_mat_train, story_maxlen, facts_maxlen)
 
 def scheduler(epoch):
     if (epoch + 1) % 20 == 0:
@@ -398,20 +432,115 @@ def scheduler(epoch):
 
 lr_schedule = LearningRateScheduler(scheduler)
 
+# Train / Validation Split
+choices = np.random.choice(len(train_facts), len(train_facts), replace=False)
+train_facts = np.array(train_facts)
+valid_facts = train_facts[choices[-len(train_facts)*0.1:]]
+train_facts = train_facts[choices[:len(train_facts)*0.9]]
+
+inputs_valid, queries_valid, answers_valid = vectorize_facts(valid_facts, word_idx, 
+                                                             story_maxlen, query_maxlen, facts_maxlen,
+                                                             enable_time=enable_time)
+PE_mat_valid = PE_matrix(inputs_valid)
+inputs_valid_p = pad_set(inputs_valid, story_maxlen, facts_maxlen)
+PE_mat_valid_p = pad_set(PE_mat_valid, story_maxlen, facts_maxlen)
+
+PE_q_valid = PE_matrix_q(queries_valid)
+queries_valid_p = pad_set_q(queries_valid, query_maxlen)
+PE_q_valid_p = pad_set_q(PE_q_valid, query_maxlen)
+
+
+BATCH_SIZE = 32
+
+show_batch_interval = 1000
+
+linear_regime = True
+
+EPOCHS = 100
+N_BATCHS = len(train_facts) // BATCH_SIZE
+EARLY_STOP_MAX = 4
+
+save_hist = []
+save_hist.append(0.)
+
+for k in xrange(EPOCHS):
+    for b,batch in enumerate(grouper(train_facts, BATCH_SIZE, fillvalue=train_facts[-1])):
+        inputs_train, queries_train, answers_train = vectorize_facts(batch, word_idx, 
+                                                                     story_maxlen, query_maxlen, facts_maxlen,
+                                                                     enable_time=enable_time)
+        
+        PE_mat_train = PE_matrix(inputs_train)
+        inputs_train_p = pad_set(inputs_train, story_maxlen, facts_maxlen)
+        PE_mat_train_p = pad_set(PE_mat_train, story_maxlen, facts_maxlen)
+
+        PE_q_train = PE_matrix_q(queries_train)
+        queries_train_p = pad_set_q(queries_train, query_maxlen)
+        PE_q_train_p = pad_set_q(PE_q_train, query_maxlen)
+        
+        loss = model.train_on_batch([inputs_train_p, PE_mat_train_p, queries_train_p, PE_q_train_p], 
+                                    answers_train)
+        if b % show_batch_interval == 0:
+            print('Epoch: {0}, Batch: {1}, loss: {2} - acc: {3}'.format(k, 
+                                                                        b, float(loss[0]), float(loss[1])))
+ 
+    losses = model.evaluate([inputs_valid_p, PE_mat_valid_p, queries_valid_p, PE_q_valid_p], 
+                            answers_valid, batch_size=BATCH_SIZE, 
+                            verbose=0)
+    print('Epoch {0}, valid loss / valid accuracy: {1} / {2}'.
+           format(k, losses[0], losses[1]))
+    
+       
+    #Saving model
+    if max(save_hist) < losses[1]:
+        model.save_weights('models/weights_memn2n_PE.hdf5', overwrite=True)
+    save_hist.append(losses[1])
+    
+    if max(save_hist) > losses[1] and linear_regime:
+        print ('Changing from linear regime ...')
+        o1,layers = hop_layer(fact_input, question_encoder, pos_encoder=PE_input)
+
+        o2,layers_1 = hop_layer(fact_input, o1, adjacent=layers[0], pos_encoder=PE_input)
+        o3,layers_2 = hop_layer(fact_input, o2, adjacent=layers_1[0], pos_encoder=PE_input)
+
+        response = Dense(vocab_size, init='normal', activation=mod_softmax, bias=False)(o3)
+
+        model = Model(input=[fact_input, PE_input, question_input, PE_question], output=[response])
+        model.load_weights('models/weights_memn2n_PE.hdf5')
+        sgd = SGD(lr=0.01, clipnorm=40.)
+    
+        model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=[categorical_accuracy])
+        linear_regime = False
+        print ('Done.')
+
+    if max(save_hist) > losses[1]:
+        early_stop += 1
+    else:
+        early_stop = 0
+    # Reduce attention loss weights at each early stop call (only two times)
+    #if early_stop >= EARLY_STOP_MAX:
+    #    break
+    scheduler(k)
+
+
 # Note: you could use a Graph model to avoid repeat the input twice
-model.fit([inputs_train_p, PE_mat_train_p, queries_train], answers_train,
-           batch_size=32,
-           nb_epoch=100,
-           validation_split=0.1,
-           callbacks=[lr_schedule],
-           verbose=2)
+#model.fit([inputs_train_p, PE_mat_train_p, queries_train], answers_train,
+#           batch_size=32,
+#           nb_epoch=100,
+#          validation_split=0.1,
+#           callbacks=[lr_schedule],
+#           verbose=2)
 
 PE_mat_test = PE_matrix(inputs_test)
 inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
 PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
 
+PE_q_test = PE_matrix_q(queries_test)
+queries_test_p = pad_set_q(queries_test, query_maxlen)
+PE_q_test_p = pad_set_q(PE_q_test, query_maxlen)
+
 print('Total Model Accuracy: ')
-loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test], answers_test, verbose=2)
+loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test_p, PE_q_test_p], 
+                           answers_test, verbose=2)
 print('Loss: {0}, Acc: {1}'.format(loss, acc))
 print('Per-Task Accuracy: ')
 passed = 0
@@ -424,8 +553,11 @@ for k, challenge in enumerate(challenge_files):
     PE_mat_test = PE_matrix(inputs_test)
     inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
     PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
+    PE_q_test = PE_matrix_q(queries_test)
+    queries_test_p = pad_set_q(queries_test, query_maxlen)
+    PE_q_test_p = pad_set_q(PE_q_test, query_maxlen)
 
-    loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test], answers_test,  verbose=2)
+    loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test_p, PE_q_test_p], answers_test,  verbose=2)
     print('\n Loss: {0}, Acc: {1}, Pass: {2} '.format(loss, acc, acc >= 0.95))
     passed += acc >= 0.95
 print ('Passed: {0}'.format(passed))
