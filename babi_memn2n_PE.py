@@ -80,7 +80,7 @@ def parse_stories(lines, only_supporting=False):
     data = []
     story = []
     for line in lines:
-        line = line.decode('utf-8').strip()
+        line = line.decode('utf-8').strip().lower()
         nid, line = line.split(' ', 1)
         nid = int(nid)
         if nid == 1:
@@ -138,21 +138,15 @@ def LJD (J, d):
     L = (1 - j/J) - (k/d)*(1 - 2*j/J)
     return L
 
-def PE_matrix(inputs_test):
-    L = []
-    for facts in inputs_test:
-        Li = []
-        for j,fact in enumerate(facts):
-            Li.append(LJD(len(fact),EMBED_HIDDEN_SIZE))
-        L.append(Li)
-    return L
+def PE_matrix(facts):
+    Li = []
+    for j,fact in enumerate(facts):
+        Li.append(LJD(len(fact),EMBED_HIDDEN_SIZE))
+    return Li
 
-def PE_matrix_q(inputs_test):
-    L = []
-    for fact in inputs_test:
-        Li = LJD(len(fact), EMBED_HIDDEN_SIZE)
-        L.append(Li)
-    return L
+def PE_matrix_q(fact):
+    Li = LJD(len(fact), EMBED_HIDDEN_SIZE)
+    return Li
 
 def pad_set(data, story_maxlen, fact_maxlen):
     X = []
@@ -214,13 +208,11 @@ for challenge in challenge_files:
     train_facts += train_facts_split[-1]
     test_facts += test_facts_split[-1]
 
-test_facts = np.array(test_facts)
 train_facts = np.array(train_facts)
-test_facts = list(test_facts[np.random.choice(len(test_facts), len(test_facts), replace=False)])
 train_facts = list(train_facts[np.random.choice(len(train_facts), len(train_facts), replace=False)])
 
 
-EMBED_HIDDEN_SIZE = 20
+EMBED_HIDDEN_SIZE = 50
 enable_time = True
 
 #print('Extracting stories for the challenge:', challenge_type)
@@ -291,8 +283,9 @@ class ModifiedBackprop(object):
         self.ops = {}  # memoizes an OpFromGraph instance per tensor type
 
     def __call__(self, x):
-        if theano.sandbox.cuda.cuda_enabled:
-            maybe_to_gpu = theano.sandbox.cuda.as_cuda_ndarray_variable
+        if theano.gpuarray.pygpu_activated:
+            ctx = theano.gpuarray.basic_ops.infer_context_name()
+            maybe_to_gpu = lambda x: theano.gpuarray.basic_ops.as_gpuarray_variable(x, ctx)
         else:
             maybe_to_gpu = lambda x: x
         x = maybe_to_gpu(x)
@@ -301,7 +294,7 @@ class ModifiedBackprop(object):
             inp = tensor_type()
             outp = maybe_to_gpu(self.nonlinearity(inp))
             op = theano.OpFromGraph([inp], [outp])
-            op.grad = self.grad
+            op.L_op = self.L_op
             self.ops[tensor_type] = op
         return self.ops[tensor_type](x)
 
@@ -309,16 +302,14 @@ softmax_grad = theano.tensor.nnet.nnet.SoftmaxGrad()
 softmax_op = theano.tensor.nnet.nnet.Softmax()
 
 class GuidedBackprop(ModifiedBackprop):
-    def grad(self, inp, grads):
+    def L_op(self, inp, outputs, grads):
         x, = inp
         g_sm, = grads
-        g_sm = g_sm * g_sm.shape[0].astype('float32') # Here I multiply to account for batch size division in
-                                                        # keras
-        sm = softmax_op(x)
-        grad = [softmax_grad(g_sm, sm)]
-        return grad
+        g_sm = g_sm * g_sm.shape[0].astype('float32')
+        return [softmax_grad(g_sm, outputs[0])]
 
 mod_softmax = GuidedBackprop(softmax)
+
 
 def position_encoder(input_layer, PE_input):
     layer_encoder = Embedding(input_dim=vocab_size,
@@ -329,7 +320,7 @@ def position_encoder(input_layer, PE_input):
     # is (max_len, fact_size,) should I create a new type of layer?
     input_encoder = Lambda(lambda x: x, 
                              output_shape=(story_maxlen, facts_maxlen, EMBED_HIDDEN_SIZE,))(input_encoder)
-    position_encoding = merge([input_encoder, PE_input],'mul')
+    position_encoding = merge([input_encoder, PE_input], 'mul')
     position_encoding = Lambda(lambda x: K.sum(x, axis=2), 
                                output_shape=(story_maxlen, EMBED_HIDDEN_SIZE,))(position_encoding)
     return position_encoding, layer_encoder
@@ -404,7 +395,7 @@ q_position_encoding = merge([question_encoder, PE_question],'mul')
 
 #question_encoder = Dropout(0.3)(question_encoder)
 question_encoder = Lambda(lambda x: K.sum(x, axis=1),
-                         output_shape=lambda shape: (shape[0],) + shape[2:])(question_encoder)
+                         output_shape=lambda shape: (shape[0],) + shape[2:])(q_position_encoding)
 
 
 o1,layers = hop_layer(fact_input, question_encoder, pos_encoder=PE_input, use_softmax=False)
@@ -425,7 +416,7 @@ print('Compilation done...')
 
 
 def scheduler(epoch):
-    if (epoch + 1) % 20 == 0:
+    if (epoch + 1) % 10 == 0:
         lr_val = model.optimizer.lr.get_value()
         model.optimizer.lr.set_value(lr_val*0.5)
     return float(model.optimizer.lr.get_value())
@@ -435,20 +426,19 @@ lr_schedule = LearningRateScheduler(scheduler)
 # Train / Validation Split
 choices = np.random.choice(len(train_facts), len(train_facts), replace=False)
 train_facts = np.array(train_facts)
-valid_facts = train_facts[choices[-len(train_facts)*0.1:]]
-train_facts = train_facts[choices[:len(train_facts)*0.9]]
+valid_facts = train_facts[choices[-int(len(train_facts)*0.1):]]
+train_facts = train_facts[choices[:int(len(train_facts)*0.9)]]
 
 inputs_valid, queries_valid, answers_valid = vectorize_facts(valid_facts, word_idx, 
                                                              story_maxlen, query_maxlen, facts_maxlen,
                                                              enable_time=enable_time)
-PE_mat_valid = PE_matrix(inputs_valid)
-inputs_valid_p = pad_set(inputs_valid, story_maxlen, facts_maxlen)
-PE_mat_valid_p = pad_set(PE_mat_valid, story_maxlen, facts_maxlen)
+PE_mat_valid = PE_matrix(inputs_valid[0])
+PE_mat_valid_p = np.array([PE_mat_valid]*len(inputs_valid), dtype='float32')
+inputs_valid_p = inputs_valid
 
-PE_q_valid = PE_matrix_q(queries_valid)
-queries_valid_p = pad_set_q(queries_valid, query_maxlen)
-PE_q_valid_p = pad_set_q(PE_q_valid, query_maxlen)
-
+PE_q_valid = PE_matrix_q(queries_valid[0])
+PE_q_valid_p = np.array([PE_q_valid]*len(queries_valid))
+queries_valid_p = queries_valid
 
 BATCH_SIZE = 32
 
@@ -456,12 +446,19 @@ show_batch_interval = 1000
 
 linear_regime = True
 
-EPOCHS = 100
+EPOCHS = 10
 N_BATCHS = len(train_facts) // BATCH_SIZE
 EARLY_STOP_MAX = 4
 
 save_hist = []
 save_hist.append(0.)
+
+PE_mat_train = PE_matrix(inputs_train[0])
+PE_mat_train_p = np.array([PE_mat_train]*BATCH_SIZE, dtype='float32')
+
+PE_q_train = PE_matrix_q(queries_train[0])
+PE_q_train_p = np.array([PE_q_train]*BATCH_SIZE)
+
 
 for k in xrange(EPOCHS):
     for b,batch in enumerate(grouper(train_facts, BATCH_SIZE, fillvalue=train_facts[-1])):
@@ -469,13 +466,8 @@ for k in xrange(EPOCHS):
                                                                      story_maxlen, query_maxlen, facts_maxlen,
                                                                      enable_time=enable_time)
         
-        PE_mat_train = PE_matrix(inputs_train)
-        inputs_train_p = pad_set(inputs_train, story_maxlen, facts_maxlen)
-        PE_mat_train_p = pad_set(PE_mat_train, story_maxlen, facts_maxlen)
-
-        PE_q_train = PE_matrix_q(queries_train)
-        queries_train_p = pad_set_q(queries_train, query_maxlen)
-        PE_q_train_p = pad_set_q(PE_q_train, query_maxlen)
+        inputs_train_p = inputs_train
+        queries_train_p = queries_train
         
         loss = model.train_on_batch([inputs_train_p, PE_mat_train_p, queries_train_p, PE_q_train_p], 
                                     answers_train)
@@ -530,13 +522,19 @@ for k in xrange(EPOCHS):
 #           callbacks=[lr_schedule],
 #           verbose=2)
 
-PE_mat_test = PE_matrix(inputs_test)
-inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
-PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
+test_facts = np.array(test_facts)
+test_facts = list(test_facts[np.array(range(len(test_facts)))])
 
-PE_q_test = PE_matrix_q(queries_test)
-queries_test_p = pad_set_q(queries_test, query_maxlen)
-PE_q_test_p = pad_set_q(PE_q_test, query_maxlen)
+inputs_test, queries_test, answers_test = vectorize_facts(test_facts, word_idx, story_maxlen, query_maxlen, facts_maxlen,
+                                                         enable_time=enable_time)
+
+PE_mat_test = PE_matrix(inputs_test[0])
+PE_mat_test_p = np.array([PE_mat_test]*len(inputs_test), dtype='float32')
+inputs_test_p = inputs_test
+
+PE_q_test = PE_matrix_q(queries_test[0])
+PE_q_test_p = np.array([PE_q_test]*len(queries_test))
+queries_test_p = queries_test
 
 print('Total Model Accuracy: ')
 loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test_p, PE_q_test_p], 
@@ -544,20 +542,22 @@ loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test_p, PE_q_t
 print('Loss: {0}, Acc: {1}'.format(loss, acc))
 print('Per-Task Accuracy: ')
 passed = 0
+total_acc = 0.
 for k, challenge in enumerate(challenge_files):
-    test_fact = test_facts_split[k]
+
     print(challenge)
-    inputs_test, queries_test, answers_test = vectorize_facts(test_fact, word_idx, story_maxlen, query_maxlen, facts_maxlen,
-                                                         enable_time=enable_time)
 
-    PE_mat_test = PE_matrix(inputs_test)
-    inputs_test_p = pad_set(inputs_test, story_maxlen, facts_maxlen)
-    PE_mat_test_p = pad_set(PE_mat_test, story_maxlen, facts_maxlen)
-    PE_q_test = PE_matrix_q(queries_test)
-    queries_test_p = pad_set_q(queries_test, query_maxlen)
-    PE_q_test_p = pad_set_q(PE_q_test, query_maxlen)
-
-    loss, acc = model.evaluate([inputs_test_p, PE_mat_test_p, queries_test_p, PE_q_test_p], answers_test,  verbose=2)
-    print('\n Loss: {0}, Acc: {1}, Pass: {2} '.format(loss, acc, acc >= 0.95))
+    
+    inputs_test_p_s = inputs_test_p[k*1000:(k+1)*1000]
+    PE_mat_test_p_s = PE_mat_test_p[k*1000:(k+1)*1000]
+    queries_test_p_s = queries_test_p[k*1000:(k+1)*1000]
+    PE_q_test_p_s = PE_q_test_p[k*1000:(k+1)*1000]
+    answers_test_s = answers_test[k*1000:(k+1)*1000]
+   
+    loss, acc = model.evaluate([inputs_test_p_s, PE_mat_test_p_s, queries_test_p_s, PE_q_test_p_s], 
+                               answers_test_s,  verbose=2)
+    total_acc += acc
+    print('Loss: {0}, Acc: {1}, Pass: {2} \n'.format(loss, acc, acc >= 0.95))
     passed += acc >= 0.95
 print ('Passed: {0}'.format(passed))
+print ('Total acc: {0}'.format(total_acc / len(challenge_files)))
